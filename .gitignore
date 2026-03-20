@@ -5,3 +5,6 @@ __pycache__/
 build/
 dist/
 *.spec
+installer.iss
+installer_output/
+assets/
