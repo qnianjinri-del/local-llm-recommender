@@ -1,44 +1,33 @@
-\# Local LLM Recommender
+# Local LLM Recommender
 
+【小白专用】一键识别电脑硬件，推荐适合本机的最新开源大模型，并通过 Ollama 一键部署。
 
+## 已实现功能
 
-一个本地开源大模型推荐与一键部署的小工具。
+- 自动识别本机硬件信息
+- 联网获取近期更新的模型家族
+- 根据硬件配置推荐适合的开源模型
+- 通过 Ollama 一键下载并部署模型
+- 在网页中直接测试模型对话
 
+## 技术栈
 
+- Python 3.13
+- Streamlit
+- Ollama
+- Hugging Face API
 
-\## 功能
+## 运行前准备
 
+请先安装：
 
+- Python 3.13
+- Ollama
+- Git
 
-\- 扫描电脑硬件信息
+并确保 Ollama 已经启动。
 
-\- 联网获取最近更新的模型家族
-
-\- 根据硬件配置推荐适合的模型
-
-\- 一键通过 Ollama 下载并部署模型
-
-\- 在网页中测试模型对话
-
-
-
-\## 运行环境
-
-
-
-\- Windows
-
-\- Python 3.13
-
-\- Ollama
-
-
-
-\## 安装依赖
-
-
+## 安装依赖
 
 ```bash
-
 python -m pip install -r requirements.txt
-
