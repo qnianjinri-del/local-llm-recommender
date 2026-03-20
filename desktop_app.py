@@ -8,9 +8,9 @@ from PySide6.QtWidgets import (
     QWidget,
     QLabel,
     QPushButton,
-    QVBoxLayout,
     QTextEdit,
     QMessageBox,
+    QVBoxLayout,
     QHBoxLayout,
     QFrame,
     QGridLayout,
@@ -24,8 +24,9 @@ from ollama_backend import (
     check_ollama_running,
     ensure_model_installed,
     generate_text,
+    try_start_ollama,
+    open_ollama_download_page,
 )
-
 
 def add_glow(widget, color="#60a5fa", blur=28, x_offset=0, y_offset=0):
     effect = QGraphicsDropShadowEffect()
@@ -33,7 +34,6 @@ def add_glow(widget, color="#60a5fa", blur=28, x_offset=0, y_offset=0):
     effect.setOffset(x_offset, y_offset)
     effect.setColor(QColor(color))
     widget.setGraphicsEffect(effect)
-
 
 class BackgroundWidget(QWidget):
     def __init__(self, image_path: str):
@@ -102,7 +102,6 @@ class BackgroundWidget(QWidget):
         painter.drawLine(self.width() - m - length, self.height() - m, self.width() - m, self.height() - m)
         painter.drawLine(self.width() - m, self.height() - m - length, self.width() - m, self.height() - m)
 
-
 class Card(QFrame):
     def __init__(self, title_text: str = ""):
         super().__init__()
@@ -118,7 +117,6 @@ class Card(QFrame):
 
         self.setLayout(self.layout)
         add_glow(self, "#3b82f6", blur=22)
-
 
 class MetricCard(QFrame):
     def __init__(self, label: str, value: str):
@@ -141,7 +139,6 @@ class MetricCard(QFrame):
 
     def update_value(self, value: str):
         self.value_widget.setText(value)
-
 
 class RecommendationCard(QFrame):
     def __init__(self, item: dict, on_select):
@@ -189,7 +186,6 @@ class RecommendationCard(QFrame):
         self.setProperty("selected", selected)
         self.style().unpolish(self)
         self.style().polish(self)
-
 
 class MainWindow(QWidget):
     def __init__(self):
@@ -266,9 +262,19 @@ class MainWindow(QWidget):
 
         # 操作控制卡片
         action_card = Card("操作控制")
+        button_row = QHBoxLayout()
+        button_row.setSpacing(10)
+
         self.scan_button = QPushButton("开始扫描并推荐")
         self.scan_button.clicked.connect(self.handle_scan)
         add_glow(self.scan_button, "#3b82f6", blur=26)
+
+        self.ollama_button = QPushButton("检测 / 启动 Ollama")
+        self.ollama_button.setObjectName("secondaryButton")
+        self.ollama_button.clicked.connect(self.handle_ollama_assist)
+
+        button_row.addWidget(self.scan_button, 2)
+        button_row.addWidget(self.ollama_button, 1)
 
         self.current_model_label = QLabel("当前模型：未选择")
         self.current_model_label.setObjectName("currentModelLabel")
@@ -279,7 +285,7 @@ class MainWindow(QWidget):
         self.deploy_button.clicked.connect(self.handle_deploy)
         add_glow(self.deploy_button, "#7c3aed", blur=24)
 
-        action_card.layout.addWidget(self.scan_button)
+        action_card.layout.addLayout(button_row)
         action_card.layout.addWidget(self.current_model_label)
         action_card.layout.addWidget(self.deploy_button)
 
@@ -563,15 +569,65 @@ class MainWindow(QWidget):
             """)
             add_glow(self.status_badge, "#ef4444", blur=24)
 
+    def show_ollama_guide_dialog(self):
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Warning)
+        msg.setWindowTitle("未检测到 Ollama")
+        msg.setText("当前没有检测到 Ollama 正在运行。")
+        msg.setInformativeText("你可以尝试自动启动；如果尚未安装，请打开 Ollama 下载页。")
+        
+        auto_btn = msg.addButton("自动尝试启动", QMessageBox.AcceptRole)
+        download_btn = msg.addButton("打开下载页", QMessageBox.ActionRole)
+        cancel_btn = msg.addButton("取消", QMessageBox.RejectRole)
+        
+        msg.exec()
+        clicked = msg.clickedButton()
+        
+        if clicked == auto_btn:
+            self.result_box.append("")
+            self.result_box.append("=== 尝试自动启动 Ollama ===")
+            
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            ok = try_start_ollama(timeout=8)
+            QApplication.restoreOverrideCursor()
+            
+            self.update_ollama_status()
+            if ok:
+                self.result_box.append("Ollama 已成功启动。")
+                self.result_box.append("")
+                QMessageBox.information(self, "启动成功", "Ollama 已成功启动。")
+                return True
+            
+            self.result_box.append("自动启动失败。")
+            self.result_box.append("")
+            QMessageBox.information(
+                self, "启动失败",
+                "没有成功自动启动 Ollama。\n\n如果尚未安装，请点击“检测 / 启动 Ollama”后选择打开下载页。"
+            )
+            return False
+        
+        if clicked == download_btn:
+            open_ollama_download_page()
+            QMessageBox.information(
+                self, "已打开下载页",
+                "已为你打开 Ollama 下载页面。\n\n安装并启动完成后，回到程序重新点击相关按钮即可。"
+            )
+            return False
+        
+        return False
+
     def ensure_ollama_ready(self):
         self.update_ollama_status()
         if check_ollama_running():
             return True
-        QMessageBox.warning(
-            self, "未检测到 Ollama",
-            "当前没有检测到 Ollama 正在运行。\n\n请先安装并启动 Ollama，然后再使用模型推荐、部署和测试功能。"
-        )
-        return False
+        return self.show_ollama_guide_dialog()
+
+    def handle_ollama_assist(self):
+        self.update_ollama_status()
+        if check_ollama_running():
+            QMessageBox.information(self, "Ollama 已就绪", "当前已检测到 Ollama 正在运行。")
+            return
+        self.show_ollama_guide_dialog()
 
     def set_hardware_summary(self, hardware: dict):
         self.os_metric.update_value(hardware.get("os", "--"))
@@ -716,7 +772,6 @@ class MainWindow(QWidget):
             return
 
         self.chat_box.setPlainText(reply)
-
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
