@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/hero.png" alt="Local LLM Recommender Hero Banner" style="width:100%; max-width:1200px;">
+  <img src="assets/hero.png" width="100%" alt="Local LLM Recommender Hero Banner">
 </p>
 
 # Local LLM Recommender
@@ -28,5 +28,11 @@
 
 ### 启动方式
 在项目根目录下：
+
 ```bash
 python desktop_app.py
+```
+
+## Code signing policy
+
+See [CODE_SIGNING_POLICY.md](./CODE_SIGNING_POLICY.md).
