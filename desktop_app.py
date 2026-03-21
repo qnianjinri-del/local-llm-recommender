@@ -2,7 +2,7 @@ import sys
 import json
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QObject, QThread, Signal
 from PySide6.QtGui import QPixmap, QPainter, QColor, QPen
 from PySide6.QtWidgets import (
     QApplication,
@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QGraphicsDropShadowEffect,
     QComboBox,
+    QProgressDialog,
 )
 
 from detector import get_hardware_info
@@ -25,10 +26,12 @@ from online_catalog import load_recent_supported_models_with_fallback
 from recommender import recommend_from_recent_models
 from ollama_backend import (
     check_ollama_running,
-    ensure_model_installed,
+    download_ollama_installer,
     generate_text,
+    is_model_installed,
+    launch_ollama_installer,
+    pull_model_stream,
     try_start_ollama,
-    open_ollama_download_page,
 )
 
 
@@ -38,6 +41,112 @@ def add_glow(widget, color="#60a5fa", blur=28, x_offset=0, y_offset=0):
     effect.setOffset(x_offset, y_offset)
     effect.setColor(QColor(color))
     widget.setGraphicsEffect(effect)
+
+
+def format_bytes(num_bytes):
+    if num_bytes is None:
+        return "--"
+
+    value = float(num_bytes)
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if value < 1024 or unit == "TB":
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024
+
+
+class OllamaInstallerDownloadWorker(QObject):
+    progress = Signal(int, str)
+    finished = Signal(str)
+    error = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        try:
+            def _progress(downloaded, total):
+                if total > 0:
+                    percent = max(0, min(100, int(downloaded * 100 / total)))
+                    text = f"正在下载 Ollama 安装器... {percent}%（{format_bytes(downloaded)} / {format_bytes(total)}）"
+                else:
+                    percent = -1
+                    text = f"正在下载 Ollama 安装器... {format_bytes(downloaded)}"
+                self.progress.emit(percent, text)
+
+            path = download_ollama_installer(
+                progress_callback=_progress,
+                stop_check=lambda: self._cancelled,
+            )
+
+            if self._cancelled:
+                self.error.emit("已取消 Ollama 安装器下载。")
+                return
+
+            self.finished.emit(path)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class ModelPullWorker(QObject):
+    progress = Signal(int, str)
+    finished = Signal(dict)
+    error = Signal(str)
+
+    def __init__(self, model_id: str):
+        super().__init__()
+        self.model_id = model_id
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        try:
+            if is_model_installed(self.model_id):
+                self.progress.emit(100, "模型已存在，无需重复下载。")
+                self.finished.emit({
+                    "status": "already_installed",
+                    "model": self.model_id,
+                })
+                return
+
+            def _status(status, payload):
+                completed = payload.get("completed")
+                total = payload.get("total")
+
+                if completed is not None and total:
+                    percent = max(0, min(100, int(completed * 100 / total)))
+                    detail = f"{status or '正在下载模型'}（{format_bytes(completed)} / {format_bytes(total)}）"
+                else:
+                    percent = -1
+                    detail = status or "正在准备下载模型..."
+
+                self.progress.emit(percent, detail)
+
+            result = pull_model_stream(
+                self.model_id,
+                status_callback=_status,
+                cancel_check=lambda: self._cancelled,
+            )
+
+            if self._cancelled:
+                self.error.emit("已取消模型下载。")
+                return
+
+            self.progress.emit(100, "模型下载完成。")
+            self.finished.emit({
+                "status": "downloaded",
+                "model": self.model_id,
+                "detail": result,
+            })
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 class BackgroundWidget(QWidget):
@@ -309,6 +418,19 @@ class MainWindow(QWidget):
         self.current_model = None
         self.background_path = "assets/bg_network.jpg"
 
+        self.ollama_download_thread = None
+        self.ollama_download_worker = None
+        self.ollama_download_dialog = None
+
+        self.model_pull_thread = None
+        self.model_pull_worker = None
+        self.model_pull_dialog = None
+
+        self.install_check_timer = QTimer(self)
+        self.install_check_timer.timeout.connect(self.check_ollama_post_install)
+        self.install_check_attempts = 0
+        self._last_model_pull_text = ""
+
         self.bg = BackgroundWidget(self.background_path)
 
         root = QVBoxLayout(self)
@@ -433,8 +555,13 @@ class MainWindow(QWidget):
         self.ollama_button.setObjectName("secondaryButton")
         self.ollama_button.clicked.connect(self.handle_ollama_assist)
 
+        self.install_ollama_button = QPushButton("下载安装 Ollama")
+        self.install_ollama_button.setObjectName("secondaryButton")
+        self.install_ollama_button.clicked.connect(self.start_ollama_installer_download)
+
         button_row.addWidget(self.scan_button, 2)
         button_row.addWidget(self.ollama_button, 1)
+        button_row.addWidget(self.install_ollama_button, 1)
 
         self.current_model_label = QLabel("当前模型：未选择\n参数建议：请先完成扫描并从右侧选择一个推荐模型。\n运行体验：扫描后会显示更直观的体验判断。")
         self.current_model_label.setObjectName("currentModelLabel")
@@ -882,10 +1009,10 @@ class MainWindow(QWidget):
         msg.setIcon(QMessageBox.Warning)
         msg.setWindowTitle("未检测到 Ollama")
         msg.setText("当前没有检测到 Ollama 正在运行。")
-        msg.setInformativeText("你可以尝试自动启动；如果尚未安装，请打开 Ollama 下载页。")
+        msg.setInformativeText("你可以尝试自动启动；如果尚未安装，可以直接在这里下载安装 Ollama。")
 
         auto_btn = msg.addButton("自动尝试启动", QMessageBox.AcceptRole)
-        download_btn = msg.addButton("打开下载页", QMessageBox.ActionRole)
+        download_btn = msg.addButton("下载安装 Ollama", QMessageBox.ActionRole)
         msg.addButton("取消", QMessageBox.RejectRole)
 
         msg.exec()
@@ -908,17 +1035,12 @@ class MainWindow(QWidget):
             QMessageBox.information(
                 self,
                 "启动失败",
-                "没有成功自动启动 Ollama。\n\n如果尚未安装，请点击“打开下载页”完成安装。"
+                "没有成功自动启动 Ollama。\n\n如果尚未安装，请点击“下载安装 Ollama”继续。"
             )
             return False
 
         if clicked == download_btn:
-            open_ollama_download_page()
-            QMessageBox.information(
-                self,
-                "已打开下载页",
-                "已为你打开 Ollama 下载页面。\n\n安装并启动完成后，回到程序重新点击相关按钮即可。"
-            )
+            self.start_ollama_installer_download()
             return False
 
         return False
@@ -935,6 +1057,209 @@ class MainWindow(QWidget):
             QMessageBox.information(self, "Ollama 已就绪", "当前已检测到 Ollama 正在运行。")
             return
         self.show_ollama_guide_dialog()
+
+    def _close_progress_dialog(self, dialog_attr_name):
+        dialog = getattr(self, dialog_attr_name, None)
+        if dialog is not None:
+            dialog.close()
+            dialog.deleteLater()
+            setattr(self, dialog_attr_name, None)
+
+    def _cleanup_thread_worker(self, thread_attr_name, worker_attr_name):
+        thread = getattr(self, thread_attr_name, None)
+        if thread is not None:
+            thread.quit()
+            thread.wait()
+            setattr(self, thread_attr_name, None)
+        setattr(self, worker_attr_name, None)
+
+    def request_cancel_ollama_download(self):
+        worker = self.ollama_download_worker
+        dialog = self.ollama_download_dialog
+        if worker is not None:
+            worker.cancel()
+        if dialog is not None:
+            dialog.setLabelText("正在取消 Ollama 安装器下载，请稍候...")
+            dialog.setCancelButton(None)
+
+    def request_cancel_model_download(self):
+        worker = self.model_download_worker
+        dialog = self.model_download_dialog
+        if worker is not None:
+            worker.cancel()
+        if dialog is not None:
+            dialog.setLabelText("正在取消模型下载，请稍候...")
+            dialog.setCancelButton(None)
+
+    def start_ollama_installer_download(self):
+        if self.ollama_download_thread is not None:
+            QMessageBox.information(self, "正在下载", "Ollama 安装器正在下载中，请稍候。")
+            return
+
+        self.result_box.append("")
+        self.result_box.append("=== 开始下载 Ollama 安装器 ===")
+
+        dialog = QProgressDialog("正在下载 Ollama 安装器...", "取消", 0, 100, self)
+        dialog.setWindowTitle("下载安装 Ollama")
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.show()
+        self.ollama_download_dialog = dialog
+
+        thread = QThread(self)
+        worker = OllamaInstallerDownloadWorker()
+        worker.moveToThread(thread)
+
+        worker.progress.connect(self.on_ollama_installer_download_progress)
+        worker.finished.connect(self.on_ollama_installer_download_finished)
+        worker.error.connect(self.on_ollama_installer_download_error)
+        dialog.canceled.connect(self.request_cancel_ollama_download)
+        thread.started.connect(worker.run)
+
+        self.ollama_download_thread = thread
+        self.ollama_download_worker = worker
+        thread.start()
+
+    def on_ollama_installer_download_progress(self, percent: int, text: str):
+        dialog = self.ollama_download_dialog
+        if dialog is None:
+            return
+
+        dialog.setLabelText(text)
+        if percent < 0:
+            dialog.setRange(0, 0)
+        else:
+            if dialog.maximum() == 0:
+                dialog.setRange(0, 100)
+            dialog.setValue(percent)
+
+    def on_ollama_installer_download_finished(self, installer_path: str):
+        self._close_progress_dialog("ollama_download_dialog")
+        self._cleanup_thread_worker("ollama_download_thread", "ollama_download_worker")
+
+        self.result_box.append(f"Ollama 安装器下载完成：{installer_path}")
+
+        try:
+            launch_ollama_installer(installer_path)
+        except Exception as e:
+            QMessageBox.critical(self, "启动安装器失败", f"安装器已经下载完成，但无法自动启动：\n{e}")
+            return
+
+        self.result_box.append("已启动 Ollama 安装器，请在弹出的安装窗口中完成安装。")
+        self.result_box.append("程序将自动轮询 Ollama 是否已安装并启动。")
+        self.result_box.append("")
+
+        self.install_check_attempts = 0
+        self.install_check_timer.start(3000)
+
+        QMessageBox.information(
+            self,
+            "安装器已启动",
+            "Ollama 安装器已下载并启动。\n\n请在弹出的安装窗口中完成安装，本软件会自动检测安装结果。",
+        )
+
+    def on_ollama_installer_download_error(self, error_text: str):
+        self._close_progress_dialog("ollama_download_dialog")
+        self._cleanup_thread_worker("ollama_download_thread", "ollama_download_worker")
+
+        if "取消" in error_text:
+            self.result_box.append("已取消 Ollama 安装器下载。")
+            self.result_box.append("")
+            return
+
+        self.result_box.append(f"Ollama 安装器下载失败：{error_text}")
+        self.result_box.append("")
+        QMessageBox.critical(self, "下载失败", f"下载 Ollama 安装器时出现错误：\n{error_text}")
+
+    def check_ollama_post_install(self):
+        self.install_check_attempts += 1
+
+        if check_ollama_running() or try_start_ollama(timeout=2):
+            self.install_check_timer.stop()
+            self.update_ollama_status()
+            self.result_box.append("已检测到 Ollama 安装完成并成功启动。")
+            self.result_box.append("")
+            QMessageBox.information(self, "安装完成", "已经检测到 Ollama 安装并启动成功。")
+            return
+
+        if self.install_check_attempts >= 40:
+            self.install_check_timer.stop()
+            self.update_ollama_status()
+            self.result_box.append("暂时还没有检测到 Ollama 启动。你可以完成安装后，再点击“检测 / 启动 Ollama”。")
+            self.result_box.append("")
+
+    def start_model_download_with_progress(self, model_id: str):
+        if self.model_pull_thread is not None:
+            QMessageBox.information(self, "正在部署", "当前已有模型正在下载/部署，请稍候。")
+            return
+
+        self._last_model_pull_text = ""
+        dialog = QProgressDialog(f"正在准备部署 {model_id} ...", "取消", 0, 100, self)
+        dialog.setWindowTitle("部署模型")
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.show()
+        self.model_pull_dialog = dialog
+
+        thread = QThread(self)
+        worker = ModelPullWorker(model_id)
+        worker.moveToThread(thread)
+
+        worker.progress.connect(self.on_model_pull_progress)
+        worker.finished.connect(self.on_model_pull_finished)
+        worker.error.connect(self.on_model_pull_error)
+        dialog.canceled.connect(self.request_cancel_model_download)
+        thread.started.connect(worker.run)
+
+        self.model_pull_thread = thread
+        self.model_pull_worker = worker
+        thread.start()
+
+    def on_model_pull_progress(self, percent: int, text: str):
+        dialog = self.model_pull_dialog
+        if dialog is None:
+            return
+
+        dialog.setLabelText(text)
+        if percent < 0:
+            dialog.setRange(0, 0)
+        else:
+            if dialog.maximum() == 0:
+                dialog.setRange(0, 100)
+            dialog.setValue(percent)
+
+        if text and text != self._last_model_pull_text:
+            self.result_box.append(text)
+            self._last_model_pull_text = text
+
+    def on_model_pull_finished(self, result: dict):
+        self._close_progress_dialog("model_pull_dialog")
+        self._cleanup_thread_worker("model_pull_thread", "model_pull_worker")
+
+        self.result_box.append("=== 部署结果 ===")
+        self.result_box.append(json.dumps(result, ensure_ascii=False, indent=2))
+        self.result_box.append("")
+
+        QMessageBox.information(self, "部署完成", f"{result.get('model', '--')} 已完成检查/部署。")
+
+    def on_model_pull_error(self, error_text: str):
+        self._close_progress_dialog("model_pull_dialog")
+        self._cleanup_thread_worker("model_pull_thread", "model_pull_worker")
+
+        if "取消" in error_text:
+            self.result_box.append("已取消模型下载。")
+            self.result_box.append("")
+            QMessageBox.information(self, "已取消", "已取消当前模型下载。")
+            return
+
+        self.result_box.append("=== 部署失败 ===")
+        self.result_box.append(error_text)
+        self.result_box.append("")
+        QMessageBox.critical(self, "部署失败", f"部署模型时出现错误：\n{error_text}")
 
     def set_catalog_mode_label(self, mode: str, message: str = ""):
         mode_text_map = {
