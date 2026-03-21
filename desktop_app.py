@@ -17,10 +17,11 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QScrollArea,
     QGraphicsDropShadowEffect,
+    QComboBox,
 )
 
 from detector import get_hardware_info
-from online_catalog import fetch_recent_supported_models
+from online_catalog import load_recent_supported_models_with_fallback
 from recommender import recommend_from_recent_models
 from ollama_backend import (
     check_ollama_running,
@@ -163,13 +164,37 @@ class RecommendationCard(QFrame):
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(8)
 
-        title = QLabel(item["display_name"])
+        title = QLabel(item["family_display_name"])
         title.setObjectName("recommendationTitle")
+
+        title2 = QLabel(f"当前推荐参数：{item.get('current_param', '--')}")
+        title2.setObjectName("recommendationSubTitle")
+
+        top_badge_text = item.get("top_badge", "")
+        if top_badge_text:
+            top_badge = QLabel(top_badge_text)
+            top_badge.setObjectName("recommendationTopBadge")
+        else:
+            top_badge = None
+
+        summary_tag_text = item.get("summary_tag", "")
+        if summary_tag_text:
+            summary_tag = QLabel(summary_tag_text)
+            summary_tag.setObjectName("recommendationTag")
+        else:
+            summary_tag = None
+
+        freshness_badge_text = item.get("freshness_badge", "")
+        if freshness_badge_text:
+            freshness_badge = QLabel(freshness_badge_text)
+            freshness_badge.setObjectName("recommendationFreshnessBadge")
+        else:
+            freshness_badge = None
 
         subtitle = QLabel(item["deploy_id"])
         subtitle.setObjectName("recommendationSubTitle")
 
-        family = QLabel(f"模型家族：{item['family']}")
+        family = QLabel(f"模型标识：{item['family']}")
         family.setObjectName("recommendationMeta")
 
         source = QLabel(f"最近官方模型：{item['source_model_id']}")
@@ -180,7 +205,54 @@ class RecommendationCard(QFrame):
         updated.setObjectName("recommendationMeta")
         updated.setWordWrap(True)
 
-        notes = QLabel(f"推荐说明：{item['notes']}")
+        score_label = QLabel(f"推荐分数：{item.get('score', 'N/A')}")
+        score_label.setObjectName("recommendationMeta")
+
+        param_section = QLabel("参数档位")
+        param_section.setObjectName("sectionLabel")
+
+        param_all = QLabel(f"这个家族的参数：{item.get('all_params_text', '--')}")
+        param_all.setObjectName("recommendationMeta")
+        param_all.setWordWrap(True)
+
+        param_fit = QLabel(f"适合你的电脑：{item.get('suitable_params_text', '--')}")
+        param_fit.setObjectName("recommendationMeta")
+        param_fit.setWordWrap(True)
+
+        param_try = QLabel(f"可尝试：{item.get('tryable_params_text', '--')}")
+        param_try.setObjectName("recommendationMeta")
+        param_try.setWordWrap(True)
+
+        param_avoid = QLabel(f"暂不建议：{item.get('avoid_params_text', '--')}")
+        param_avoid.setObjectName("recommendationMeta")
+        param_avoid.setWordWrap(True)
+
+        runtime_section = QLabel("运行体验")
+        runtime_section.setObjectName("sectionLabel")
+
+        runtime_feel = QLabel(f"体验判断：{item.get('runtime_feel', '--')}")
+        runtime_feel.setObjectName("recommendationMeta")
+
+        runtime_note = QLabel(f"体验说明：{item.get('runtime_note', '')}")
+        runtime_note.setObjectName("recommendationMeta")
+        runtime_note.setWordWrap(True)
+
+        deploy_level = QLabel(f"部署门槛：{item.get('deploy_level', '--')}")
+        deploy_level.setObjectName("recommendationMeta")
+
+        reason_label = QLabel(f"推荐理由：{item.get('reason', '')}")
+        reason_label.setObjectName("recommendationMeta")
+        reason_label.setWordWrap(True)
+
+        not_recommended = QLabel(f"为什么没推荐更大参数：{item.get('not_recommended_explanation', '')}")
+        not_recommended.setObjectName("recommendationNote")
+        not_recommended.setWordWrap(True)
+
+        deploy_tip = QLabel(f"部署提示：{item.get('deploy_tip', '')}")
+        deploy_tip.setObjectName("recommendationNote")
+        deploy_tip.setWordWrap(True)
+
+        notes = QLabel(f"推荐说明：{item.get('notes', '')}")
         notes.setObjectName("recommendationNote")
         notes.setWordWrap(True)
 
@@ -189,10 +261,30 @@ class RecommendationCard(QFrame):
         select_btn.clicked.connect(lambda: self.on_select(self.item))
 
         layout.addWidget(title)
+        layout.addWidget(title2)
+        if top_badge:
+            layout.addWidget(top_badge)
+        if summary_tag:
+            layout.addWidget(summary_tag)
+        if freshness_badge:
+            layout.addWidget(freshness_badge)
         layout.addWidget(subtitle)
         layout.addWidget(family)
         layout.addWidget(source)
         layout.addWidget(updated)
+        layout.addWidget(score_label)
+        layout.addWidget(param_section)
+        layout.addWidget(param_all)
+        layout.addWidget(param_fit)
+        layout.addWidget(param_try)
+        layout.addWidget(param_avoid)
+        layout.addWidget(runtime_section)
+        layout.addWidget(runtime_feel)
+        layout.addWidget(runtime_note)
+        layout.addWidget(deploy_level)
+        layout.addWidget(reason_label)
+        layout.addWidget(not_recommended)
+        layout.addWidget(deploy_tip)
         layout.addWidget(notes)
         layout.addWidget(select_btn)
 
@@ -299,6 +391,37 @@ class MainWindow(QWidget):
 
         action_card = Card("操作控制")
 
+        preference_row = QHBoxLayout()
+        preference_row.setSpacing(10)
+
+        preference_label = QLabel("推荐偏好：")
+        preference_label.setObjectName("sectionLabel")
+
+        self.preference_combo = QComboBox()
+        self.preference_combo.setObjectName("preferenceCombo")
+        self.preference_combo.addItem("平衡推荐", "balanced")
+        self.preference_combo.addItem("速度优先", "speed")
+        self.preference_combo.addItem("能力优先", "capability")
+
+        preference_row.addWidget(preference_label)
+        preference_row.addWidget(self.preference_combo, 1)
+
+        sort_row = QHBoxLayout()
+        sort_row.setSpacing(10)
+
+        sort_label = QLabel("排序方式：")
+        sort_label.setObjectName("sectionLabel")
+
+        self.sort_combo = QComboBox()
+        self.sort_combo.setObjectName("preferenceCombo")
+        self.sort_combo.addItem("综合推荐", "overall")
+        self.sort_combo.addItem("更轻量优先", "lightweight")
+        self.sort_combo.addItem("更强能力优先", "capability")
+        self.sort_combo.addItem("更新更近优先", "freshness")
+
+        sort_row.addWidget(sort_label)
+        sort_row.addWidget(self.sort_combo, 1)
+
         button_row = QHBoxLayout()
         button_row.setSpacing(10)
 
@@ -313,17 +436,29 @@ class MainWindow(QWidget):
         button_row.addWidget(self.scan_button, 2)
         button_row.addWidget(self.ollama_button, 1)
 
-        self.current_model_label = QLabel("当前模型：未选择")
+        self.current_model_label = QLabel("当前模型：未选择\n参数建议：请先完成扫描并从右侧选择一个推荐模型。\n运行体验：扫描后会显示更直观的体验判断。")
         self.current_model_label.setObjectName("currentModelLabel")
         self.current_model_label.setWordWrap(True)
+
+        self.catalog_mode_label = QLabel("模型来源：尚未扫描")
+        self.catalog_mode_label.setObjectName("catalogModeLabel")
+        self.catalog_mode_label.setWordWrap(True)
+
+        self.limit_explain_label = QLabel("参数上限解释：完成扫描后，这里会说明为什么更大的参数没有被优先推荐。")
+        self.limit_explain_label.setObjectName("limitExplainLabel")
+        self.limit_explain_label.setWordWrap(True)
 
         self.deploy_button = QPushButton("一键部署当前模型")
         self.deploy_button.setEnabled(False)
         self.deploy_button.clicked.connect(self.handle_deploy)
         add_glow(self.deploy_button, "#7c3aed", blur=24)
 
+        action_card.layout.addLayout(preference_row)
+        action_card.layout.addLayout(sort_row)
         action_card.layout.addLayout(button_row)
         action_card.layout.addWidget(self.current_model_label)
+        action_card.layout.addWidget(self.catalog_mode_label)
+        action_card.layout.addWidget(self.limit_explain_label)
         action_card.layout.addWidget(self.deploy_button)
 
         log_card = Card("运行日志")
@@ -482,6 +617,24 @@ class MainWindow(QWidget):
                 padding: 10px;
             }
 
+            QLabel#catalogModeLabel {
+                font-size: 12px;
+                color: #dbeafe;
+                background-color: rgba(15, 23, 42, 68);
+                border: 1px solid rgba(125, 211, 252, 60);
+                border-radius: 12px;
+                padding: 10px;
+            }
+
+            QLabel#limitExplainLabel {
+                font-size: 12px;
+                color: #e2e8f0;
+                background-color: rgba(30, 41, 59, 88);
+                border: 1px solid rgba(250, 204, 21, 70);
+                border-radius: 12px;
+                padding: 10px;
+            }
+
             QFrame#card {
                 background-color: rgba(7, 14, 28, 102);
                 border: 1px solid rgba(120, 170, 255, 92);
@@ -520,6 +673,39 @@ class MainWindow(QWidget):
                 font-size: 16px;
                 font-weight: 700;
                 color: #f8fbff;
+            }
+
+            QLabel#recommendationTopBadge {
+                font-size: 11px;
+                font-weight: 800;
+                color: #ecfeff;
+                background-color: rgba(34, 197, 94, 0.28);
+                border: 1px solid rgba(74, 222, 128, 0.75);
+                border-radius: 10px;
+                padding: 5px 10px;
+                max-width: 90px;
+            }
+
+            QLabel#recommendationTag {
+                font-size: 11px;
+                font-weight: 700;
+                color: #dbeafe;
+                background-color: rgba(37, 99, 235, 0.25);
+                border: 1px solid rgba(96, 165, 250, 0.75);
+                border-radius: 10px;
+                padding: 5px 10px;
+                max-width: 90px;
+            }
+
+            QLabel#recommendationFreshnessBadge {
+                font-size: 11px;
+                font-weight: 800;
+                color: #fff7ed;
+                background-color: rgba(249, 115, 22, 0.22);
+                border: 1px solid rgba(251, 146, 60, 0.78);
+                border-radius: 10px;
+                padding: 5px 10px;
+                max-width: 90px;
             }
 
             QLabel#recommendationSubTitle {
@@ -577,6 +763,33 @@ class MainWindow(QWidget):
 
             QPushButton#secondaryButton:hover {
                 background-color: rgba(30, 41, 59, 120);
+            }
+
+            QComboBox#preferenceCombo {
+                background-color: rgba(8, 15, 30, 88);
+                border: 1px solid rgba(120, 170, 255, 72);
+                border-radius: 12px;
+                padding: 8px 12px;
+                min-height: 22px;
+                color: #eef4ff;
+            }
+
+            QComboBox#preferenceCombo:hover {
+                border: 1px solid rgba(180, 220, 255, 120);
+            }
+
+            QComboBox#preferenceCombo::drop-down {
+                border: none;
+                width: 28px;
+                background: transparent;
+            }
+
+            QComboBox#preferenceCombo QAbstractItemView {
+                background-color: rgba(8, 15, 30, 235);
+                color: #eef4ff;
+                border: 1px solid rgba(120, 170, 255, 110);
+                selection-background-color: rgba(37, 99, 235, 180);
+                outline: 0;
             }
 
             QTextEdit {
@@ -723,6 +936,33 @@ class MainWindow(QWidget):
             return
         self.show_ollama_guide_dialog()
 
+    def set_catalog_mode_label(self, mode: str, message: str = ""):
+        mode_text_map = {
+            "online": "模型来源：在线最新列表",
+            "cache": "模型来源：本地缓存",
+            "offline": "模型来源：离线内置目录",
+        }
+        title = mode_text_map.get(mode, "模型来源：未知")
+        if message:
+            self.catalog_mode_label.setText(f"{title}\n{message}")
+        else:
+            self.catalog_mode_label.setText(title)
+
+    def build_catalog_log_lines(self, catalog_state: dict):
+        lines = []
+        mode = catalog_state.get("mode", "unknown")
+        message = catalog_state.get("message", "")
+        error = catalog_state.get("error", "")
+
+        lines.append("=== 模型来源 ===")
+        lines.append(f"来源模式: {mode}")
+        if message:
+            lines.append(f"说明: {message}")
+        if error:
+            lines.append(f"在线失败原因: {error}")
+        lines.append("")
+        return lines
+
     def set_hardware_summary(self, hardware: dict):
         self.os_metric.update_value(hardware.get("os", "--"))
         self.cpu_metric.update_value(f"{hardware.get('cpu_cores_logical', '--')} 线程")
@@ -763,9 +1003,31 @@ class MainWindow(QWidget):
 
     def select_recommendation(self, item):
         self.current_model = item
-        self.current_model_label.setText(
-            f"当前模型：{item['display_name']}  |  {item['deploy_id']}"
-        )
+
+        lines = [f"当前模型：{item['family_display_name']}  |  {item['deploy_id']}"]
+        lines.append(f"当前推荐参数：{item.get('current_param', '--')}")
+        lines.append(f"适合你的电脑：{item.get('suitable_params_text', '无')}")
+        if item.get("runtime_feel"):
+            lines.append(f"运行体验：{item['runtime_feel']}")
+        if item.get("runtime_note"):
+            lines.append(f"体验说明：{item['runtime_note']}")
+        if item.get("summary_tag"):
+            lines.append(f"推荐标签：{item['summary_tag']}")
+        if item.get("freshness_badge"):
+            lines.append(f"新鲜度标签：{item['freshness_badge']}")
+        if item.get("deploy_level"):
+            lines.append(f"部署门槛：{item['deploy_level']}")
+        if item.get("deploy_tip"):
+            lines.append(f"部署提示：{item['deploy_tip']}")
+        if item.get("not_recommended_explanation"):
+            lines.append(f"更大参数说明：{item['not_recommended_explanation']}")
+
+        self.current_model_label.setText("\n".join(lines))
+        if item.get("limit_summary"):
+            explain_text = f"参数上限解释：{item['limit_summary']}"
+            if item.get("limit_examples_text"):
+                explain_text += f"\n{item['limit_examples_text']}"
+            self.limit_explain_label.setText(explain_text)
         self.deploy_button.setEnabled(True)
         self.chat_button.setEnabled(True)
 
@@ -778,11 +1040,17 @@ class MainWindow(QWidget):
 
         try:
             hardware = get_hardware_info()
-            recent_models = fetch_recent_supported_models(limit_per_family=5)
+            catalog_state = load_recent_supported_models_with_fallback(limit_per_family=8)
+            recent_models = catalog_state["models"]
+            user_preference = self.preference_combo.currentData()
+            sort_mode = self.sort_combo.currentData()
             recommendations = recommend_from_recent_models(
                 recent_models,
                 hardware,
                 category="general",
+                user_preference=user_preference,
+                sort_mode=sort_mode,
+                top_n=8,
             )
         except Exception as e:
             QMessageBox.critical(self, "扫描失败", f"扫描或推荐过程中出现错误：\n{e}")
@@ -790,29 +1058,63 @@ class MainWindow(QWidget):
 
         self.recommendations = recommendations
         self.current_model = None
-        self.current_model_label.setText("当前模型：未选择")
+        self.current_model_label.setText("当前模型：未选择\n参数建议：请先从推荐列表里选择一个模型。\n运行体验：选择模型后显示。")
+        self.limit_explain_label.setText("参数上限解释：完成扫描后，这里会说明为什么更大的参数没有被优先推荐。")
         self.deploy_button.setEnabled(False)
         self.chat_button.setEnabled(False)
         self.chat_box.clear()
 
         self.set_hardware_summary(hardware)
+        self.set_catalog_mode_label(catalog_state.get("mode", "unknown"), catalog_state.get("message", ""))
         self.render_recommendations(recommendations)
 
         output_lines = []
         output_lines.append("=== 硬件信息 ===")
         output_lines.append(json.dumps(hardware, ensure_ascii=False, indent=2))
         output_lines.append("")
+        output_lines.extend(self.build_catalog_log_lines(catalog_state))
         output_lines.append("=== 推荐结果 ===")
+        output_lines.append(f"当前推荐偏好: {user_preference}")
+        output_lines.append(f"当前排序方式: {sort_mode}")
+        output_lines.append("")
 
         if recommendations:
             for item in recommendations:
-                output_lines.append(f"模型名称: {item['display_name']}")
+                output_lines.append(f"模型家族: {item['family_display_name']}")
                 output_lines.append(f"部署标签: {item['deploy_id']}")
-                output_lines.append(f"模型家族: {item['family']}")
+                output_lines.append(f"当前推荐参数: {item.get('current_param', '--')}")
+                output_lines.append(f"模型标识: {item['family']}")
                 output_lines.append(f"最近官方模型: {item['source_model_id']}")
                 output_lines.append(f"最近更新时间: {item['last_modified']}")
+                if item.get("top_badge"):
+                    output_lines.append(f"首选标签: {item['top_badge']}")
+                if item.get("summary_tag"):
+                    output_lines.append(f"推荐标签: {item['summary_tag']}")
+                if item.get("freshness_badge"):
+                    output_lines.append(f"新鲜度标签: {item['freshness_badge']}")
+                output_lines.append(f"这个家族的参数: {item.get('all_params_text', '--')}")
+                output_lines.append(f"适合你的电脑: {item.get('suitable_params_text', '--')}")
+                output_lines.append(f"可尝试: {item.get('tryable_params_text', '--')}")
+                output_lines.append(f"暂不建议: {item.get('avoid_params_text', '--')}")
+                if item.get("runtime_feel"):
+                    output_lines.append(f"运行体验: {item['runtime_feel']}")
+                if item.get("runtime_note"):
+                    output_lines.append(f"体验说明: {item['runtime_note']}")
+                if item.get("deploy_level"):
+                    output_lines.append(f"部署门槛: {item['deploy_level']}")
+                if item.get("deploy_tip"):
+                    output_lines.append(f"部署提示: {item['deploy_tip']}")
+                if item.get("not_recommended_explanation"):
+                    output_lines.append(f"为什么没推荐更大参数: {item['not_recommended_explanation']}")
+                output_lines.append(f"参数建议:\n{item.get('tier_advice_text', '')}")
                 output_lines.append(f"说明: {item['notes']}")
                 output_lines.append("-" * 40)
+
+            if recommendations[0].get("limit_summary"):
+                output_lines.append("=== 参数上限解释 ===")
+                output_lines.append(recommendations[0]["limit_summary"])
+                output_lines.append(recommendations[0].get("limit_examples_text", ""))
+                output_lines.append("")
 
             self.select_recommendation(recommendations[0])
         else:
@@ -830,6 +1132,27 @@ class MainWindow(QWidget):
             return
 
         model_id = self.current_model["deploy_id"]
+        confirm_text = "\n".join([
+            f"模型家族：{self.current_model.get('family_display_name', '--')}",
+            f"当前推荐参数：{self.current_model.get('current_param', '--')}",
+            f"预计下载体积：{self.current_model.get('download_size_gb', '--')}GB",
+            f"部署门槛：{self.current_model.get('deploy_level', '--')}",
+            f"适合你的电脑：{self.current_model.get('suitable_params_text', '--')}",
+            f"运行体验：{self.current_model.get('runtime_feel', '--')}",
+            "",
+            f"体验说明：{self.current_model.get('runtime_note', '')}",
+            f"部署提示：{self.current_model.get('deploy_tip', '')}",
+            f"更大参数说明：{self.current_model.get('not_recommended_explanation', '')}",
+        ])
+        reply = QMessageBox.question(
+            self,
+            "确认部署",
+            confirm_text,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if reply != QMessageBox.Yes:
+            return
 
         self.result_box.append("")
         self.result_box.append(f"=== 开始部署 {model_id} ===")

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/hero.png" width="100%" alt="Local LLM Recommender Hero Banner">
+  <img src="assets/hero.png" alt="Local LLM Recommender Hero Banner" style="width:100%; max-width:1200px;">
 </p>
 
 # Local LLM Recommender
