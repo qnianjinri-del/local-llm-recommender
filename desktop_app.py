@@ -1,6 +1,13 @@
 import sys
 import json
+import os
+import subprocess
 from pathlib import Path
+
+
+def resource_path(relative_path):
+    base_path = getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)
+    return str(Path(base_path) / relative_path)
 
 from PySide6.QtCore import Qt, QTimer, QObject, QThread, Signal
 from PySide6.QtGui import QPixmap, QPainter, QColor, QPen
@@ -27,15 +34,24 @@ from recommender import recommend_from_recent_models
 from ollama_backend import (
     check_ollama_running,
     download_ollama_installer,
+    ensure_model_installed,
     generate_text,
     is_model_installed,
     launch_ollama_installer,
+    launch_ollama_powershell_install,
+    open_ollama_download_page,
     pull_model_stream,
     try_start_ollama,
 )
 
+PERFORMANCE_MODE = True
+RECOMMENDATION_LIMIT = 6
+
 
 def add_glow(widget, color="#60a5fa", blur=28, x_offset=0, y_offset=0):
+    if PERFORMANCE_MODE:
+        return
+
     effect = QGraphicsDropShadowEffect()
     effect.setBlurRadius(blur)
     effect.setOffset(x_offset, y_offset)
@@ -54,6 +70,41 @@ def format_bytes(num_bytes):
                 return f"{int(value)} {unit}"
             return f"{value:.1f} {unit}"
         value /= 1024
+
+
+def find_ollama_gui_executable():
+    candidates = [
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "Ollama app.exe",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "Ollama.exe",
+    ]
+
+    for path in candidates:
+        if path.exists():
+            return path
+
+    install_dir = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama"
+    if install_dir.exists():
+        for path in sorted(install_dir.glob("*.exe")):
+            if path.exists():
+                return path
+
+    return None
+
+
+def open_ollama_app():
+    exe_path = find_ollama_gui_executable()
+    if exe_path and exe_path.exists():
+        os.startfile(str(exe_path))
+        return True
+
+    # 退一步：至少尝试启动服务，让用户随后手动打开 Ollama。
+    try:
+        if try_start_ollama(timeout=8):
+            return True
+    except Exception:
+        pass
+
+    return False
 
 
 class OllamaInstallerDownloadWorker(QObject):
@@ -79,8 +130,12 @@ class OllamaInstallerDownloadWorker(QObject):
                     text = f"正在下载 Ollama 安装器... {format_bytes(downloaded)}"
                 self.progress.emit(percent, text)
 
+            def _message(text):
+                self.progress.emit(-1, text)
+
             path = download_ollama_installer(
                 progress_callback=_progress,
+                message_callback=_message,
                 stop_check=lambda: self._cancelled,
             )
 
@@ -149,62 +204,76 @@ class ModelPullWorker(QObject):
             self.error.emit(str(e))
 
 
+
+
+class ChatGenerateWorker(QObject):
+    finished = Signal(str)
+    error = Signal(str)
+
+    def __init__(self, model_id: str, prompt: str):
+        super().__init__()
+        self.model_id = model_id
+        self.prompt = prompt
+
+    def run(self):
+        try:
+            reply = generate_text(self.model_id, self.prompt)
+            self.finished.emit(reply)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 class BackgroundWidget(QWidget):
     def __init__(self, image_path: str):
         super().__init__()
         self.image_path = image_path
         self.pixmap = QPixmap(image_path) if Path(image_path).exists() else QPixmap()
+        self._cached = QPixmap()
 
-        self.scan_y = 0
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.advance_animation)
-        self.timer.start(35)
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_cache()
 
-    def advance_animation(self):
-        self.scan_y += 2
-        if self.scan_y > max(1, self.height()):
-            self.scan_y = 0
-        self.update()
+    def _update_cache(self):
+        if self.pixmap.isNull() or self.width() <= 0 or self.height() <= 0:
+            self._cached = QPixmap()
+            return
+
+        self._cached = self.pixmap.scaled(
+            self.size(),
+            Qt.KeepAspectRatioByExpanding,
+            Qt.FastTransformation if PERFORMANCE_MODE else Qt.SmoothTransformation,
+        )
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
-        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.Antialiasing, not PERFORMANCE_MODE)
 
-        if not self.pixmap.isNull():
-            scaled = self.pixmap.scaled(
-                self.size(),
-                Qt.KeepAspectRatioByExpanding,
-                Qt.SmoothTransformation,
-            )
-            x = (self.width() - scaled.width()) // 2
-            y = (self.height() - scaled.height()) // 2
-            painter.drawPixmap(x, y, scaled)
-            painter.fillRect(self.rect(), QColor(6, 10, 22, 75))
+        if not self._cached.isNull():
+            x = (self.width() - self._cached.width()) // 2
+            y = (self.height() - self._cached.height()) // 2
+            painter.drawPixmap(x, y, self._cached)
+            painter.fillRect(self.rect(), QColor(6, 10, 22, 95))
         else:
             painter.fillRect(self.rect(), QColor(8, 12, 26))
 
-        painter.fillRect(self.rect(), QColor(30, 50, 95, 22))
+        painter.fillRect(self.rect(), QColor(30, 50, 95, 18))
 
-        grid_pen = QPen(QColor(90, 140, 255, 18))
+        grid_pen = QPen(QColor(90, 140, 255, 12 if PERFORMANCE_MODE else 18))
         grid_pen.setWidth(1)
         painter.setPen(grid_pen)
 
-        grid_size = 36
+        grid_size = 44 if PERFORMANCE_MODE else 36
         for x in range(0, self.width(), grid_size):
             painter.drawLine(x, 0, x, self.height())
         for y in range(0, self.height(), grid_size):
             painter.drawLine(0, y, self.width(), y)
 
-        scan_color = QColor(56, 189, 248, 42)
-        painter.fillRect(0, self.scan_y, self.width(), 3, scan_color)
-        painter.fillRect(0, max(0, self.scan_y - 10), self.width(), 14, QColor(56, 189, 248, 10))
-
-        corner_pen = QPen(QColor(125, 211, 252, 40))
+        corner_pen = QPen(QColor(125, 211, 252, 24 if PERFORMANCE_MODE else 40))
         corner_pen.setWidth(2)
         painter.setPen(corner_pen)
 
-        length = 36
+        length = 28 if PERFORMANCE_MODE else 36
         m = 12
         painter.drawLine(m, m, m + length, m)
         painter.drawLine(m, m, m, m + length)
@@ -353,18 +422,6 @@ class RecommendationCard(QFrame):
         reason_label.setObjectName("recommendationMeta")
         reason_label.setWordWrap(True)
 
-        not_recommended = QLabel(f"为什么没推荐更大参数：{item.get('not_recommended_explanation', '')}")
-        not_recommended.setObjectName("recommendationNote")
-        not_recommended.setWordWrap(True)
-
-        deploy_tip = QLabel(f"部署提示：{item.get('deploy_tip', '')}")
-        deploy_tip.setObjectName("recommendationNote")
-        deploy_tip.setWordWrap(True)
-
-        notes = QLabel(f"推荐说明：{item.get('notes', '')}")
-        notes.setObjectName("recommendationNote")
-        notes.setWordWrap(True)
-
         select_btn = QPushButton("设为当前模型")
         select_btn.setObjectName("secondaryButton")
         select_btn.clicked.connect(lambda: self.on_select(self.item))
@@ -392,9 +449,6 @@ class RecommendationCard(QFrame):
         layout.addWidget(runtime_note)
         layout.addWidget(deploy_level)
         layout.addWidget(reason_label)
-        layout.addWidget(not_recommended)
-        layout.addWidget(deploy_tip)
-        layout.addWidget(notes)
         layout.addWidget(select_btn)
 
         self.setLayout(layout)
@@ -416,7 +470,7 @@ class MainWindow(QWidget):
         self.recommendations = []
         self.recommendation_cards = []
         self.current_model = None
-        self.background_path = "assets/bg_network.jpg"
+        self.background_path = resource_path("assets/bg_network.jpg")
 
         self.ollama_download_thread = None
         self.ollama_download_worker = None
@@ -426,10 +480,20 @@ class MainWindow(QWidget):
         self.model_pull_worker = None
         self.model_pull_dialog = None
 
+        self.chat_thread = None
+        self.chat_worker = None
+        self.chat_dialog = None
+
         self.install_check_timer = QTimer(self)
         self.install_check_timer.timeout.connect(self.check_ollama_post_install)
         self.install_check_attempts = 0
         self._last_model_pull_text = ""
+        self.deploy_anim_timer = QTimer(self)
+        self.deploy_anim_timer.setInterval(450)
+        self.deploy_anim_timer.timeout.connect(self._tick_deploy_animation)
+        self._deploy_anim_base_text = ""
+        self._deploy_anim_button_base = ""
+        self._deploy_anim_dots = 0
 
         self.bg = BackgroundWidget(self.background_path)
 
@@ -513,36 +577,21 @@ class MainWindow(QWidget):
 
         action_card = Card("操作控制")
 
-        preference_row = QHBoxLayout()
-        preference_row.setSpacing(10)
+        strategy_row = QHBoxLayout()
+        strategy_row.setSpacing(10)
 
-        preference_label = QLabel("推荐偏好：")
-        preference_label.setObjectName("sectionLabel")
+        strategy_label = QLabel("推荐模式：")
+        strategy_label.setObjectName("sectionLabel")
 
-        self.preference_combo = QComboBox()
-        self.preference_combo.setObjectName("preferenceCombo")
-        self.preference_combo.addItem("平衡推荐", "balanced")
-        self.preference_combo.addItem("速度优先", "speed")
-        self.preference_combo.addItem("能力优先", "capability")
+        self.strategy_combo = QComboBox()
+        self.strategy_combo.setObjectName("preferenceCombo")
+        self.strategy_combo.addItem("平衡推荐", {"preference": "balanced", "sort": "overall"})
+        self.strategy_combo.addItem("轻量优先", {"preference": "speed", "sort": "lightweight"})
+        self.strategy_combo.addItem("性能优先", {"preference": "capability", "sort": "capability"})
+        self.strategy_combo.addItem("新模型优先", {"preference": "balanced", "sort": "freshness"})
 
-        preference_row.addWidget(preference_label)
-        preference_row.addWidget(self.preference_combo, 1)
-
-        sort_row = QHBoxLayout()
-        sort_row.setSpacing(10)
-
-        sort_label = QLabel("排序方式：")
-        sort_label.setObjectName("sectionLabel")
-
-        self.sort_combo = QComboBox()
-        self.sort_combo.setObjectName("preferenceCombo")
-        self.sort_combo.addItem("综合推荐", "overall")
-        self.sort_combo.addItem("更轻量优先", "lightweight")
-        self.sort_combo.addItem("更强能力优先", "capability")
-        self.sort_combo.addItem("更新更近优先", "freshness")
-
-        sort_row.addWidget(sort_label)
-        sort_row.addWidget(self.sort_combo, 1)
+        strategy_row.addWidget(strategy_label)
+        strategy_row.addWidget(self.strategy_combo, 1)
 
         button_row = QHBoxLayout()
         button_row.setSpacing(10)
@@ -575,17 +624,21 @@ class MainWindow(QWidget):
         self.limit_explain_label.setObjectName("limitExplainLabel")
         self.limit_explain_label.setWordWrap(True)
 
+        self.busy_state_label = QLabel("当前状态：空闲")
+        self.busy_state_label.setObjectName("busyStateLabel")
+        self.busy_state_label.setWordWrap(True)
+
         self.deploy_button = QPushButton("一键部署当前模型")
         self.deploy_button.setEnabled(False)
         self.deploy_button.clicked.connect(self.handle_deploy)
         add_glow(self.deploy_button, "#7c3aed", blur=24)
 
-        action_card.layout.addLayout(preference_row)
-        action_card.layout.addLayout(sort_row)
+        action_card.layout.addLayout(strategy_row)
         action_card.layout.addLayout(button_row)
         action_card.layout.addWidget(self.current_model_label)
         action_card.layout.addWidget(self.catalog_mode_label)
         action_card.layout.addWidget(self.limit_explain_label)
+        action_card.layout.addWidget(self.busy_state_label)
         action_card.layout.addWidget(self.deploy_button)
 
         log_card = Card("运行日志")
@@ -603,7 +656,7 @@ class MainWindow(QWidget):
         right_col.setSpacing(16)
 
         recommendation_card = Card("推荐模型")
-        rec_tip = QLabel("根据本机硬件与近期官方模型动态推荐。点击“设为当前模型”后即可部署或测试。")
+        rec_tip = QLabel("根据本机硬件与近期官方模型动态推荐。点击“设为当前模型”后即可部署。")
         rec_tip.setObjectName("tipLabel")
         rec_tip.setWordWrap(True)
 
@@ -632,38 +685,19 @@ class MainWindow(QWidget):
         main_row.addLayout(left_col, 3)
         main_row.addLayout(right_col, 2)
 
-        chat_card = Card("测试对话")
-
-        prompt_label = QLabel("测试问题")
-        prompt_label.setObjectName("sectionLabel")
-
         self.prompt_box = QTextEdit()
-        self.prompt_box.setObjectName("promptBox")
-        self.prompt_box.setFixedHeight(100)
-        self.prompt_box.setPlainText("请用中文一句话介绍你自己。")
+        self.prompt_box.hide()
 
         self.chat_button = QPushButton("发送测试消息")
         self.chat_button.setEnabled(False)
-        self.chat_button.clicked.connect(self.handle_chat)
-        add_glow(self.chat_button, "#06b6d4", blur=24)
-
-        reply_label = QLabel("模型回复")
-        reply_label.setObjectName("sectionLabel")
+        self.chat_button.hide()
 
         self.chat_box = QTextEdit()
         self.chat_box.setReadOnly(True)
-        self.chat_box.setObjectName("chatBox")
-        self.chat_box.setPlaceholderText("这里会显示模型回复。")
-
-        chat_card.layout.addWidget(prompt_label)
-        chat_card.layout.addWidget(self.prompt_box)
-        chat_card.layout.addWidget(self.chat_button)
-        chat_card.layout.addWidget(reply_label)
-        chat_card.layout.addWidget(self.chat_box)
+        self.chat_box.hide()
 
         self.container.addLayout(header)
         self.container.addLayout(main_row, 3)
-        self.container.addWidget(chat_card, 2)
 
     def apply_styles(self):
         self.setStyleSheet("""
@@ -1058,6 +1092,75 @@ class MainWindow(QWidget):
             return
         self.show_ollama_guide_dialog()
 
+    def start_ollama_powershell_install_flow(self):
+        self.result_box.append("")
+        self.result_box.append("=== 使用 PowerShell 安装 Ollama ===")
+        self.result_box.append("已启动官方 PowerShell 安装命令，请在弹出的 PowerShell 窗口中继续。")
+        self.result_box.append("程序将自动轮询 Ollama 是否已安装并启动。")
+        self.result_box.append("")
+
+        try:
+            launch_ollama_powershell_install()
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "启动失败",
+                f"无法启动 PowerShell 安装流程：\n{e}\n\n你也可以改用“打开官方下载页”。",
+            )
+            return
+
+        self.install_check_attempts = 0
+        self.install_check_timer.start(3000)
+
+        QMessageBox.information(
+            self,
+            "已启动 PowerShell 安装",
+            "已启动官方 PowerShell 安装命令。\n\n请在弹出的 PowerShell 窗口中完成安装，本软件会自动检测安装结果。",
+        )
+
+    def make_ollama_download_error_human_friendly(self, error_text: str):
+        lower = str(error_text).lower()
+
+        if "10054" in lower or "connection reset" in lower or "connection aborted" in lower:
+            return "下载连接被中途断开了，通常是网络波动或下载链路不稳定导致的。"
+
+        if "read timed out" in lower or "connecttimeout" in lower or "timeout" in lower:
+            return "连接 Ollama 下载服务器超时了，可能是当前网络较慢或连接不稳定。"
+
+        if "proxy" in lower:
+            return "当前网络代理设置可能影响了安装器下载。"
+
+        if "ssl" in lower or "certificate" in lower:
+            return "当前网络环境的证书或安全校验导致下载失败。"
+
+        return "下载安装 Ollama 时出现了网络问题，导致安装器没有完整下载下来。"
+
+    def show_ollama_download_failure_dialog(self, error_text: str):
+        friendly = self.make_ollama_download_error_human_friendly(error_text)
+
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Warning)
+        msg.setWindowTitle("下载安装失败")
+        msg.setText("下载 Ollama 安装器失败。")
+        msg.setInformativeText(
+            f"{friendly}\n\n你可以重试下载，或改用官方 PowerShell 安装方式。"
+        )
+
+        retry_btn = msg.addButton("重试下载", QMessageBox.AcceptRole)
+        ps_btn = msg.addButton("PowerShell 安装", QMessageBox.ActionRole)
+        page_btn = msg.addButton("打开官方下载页", QMessageBox.ActionRole)
+        msg.addButton("取消", QMessageBox.RejectRole)
+
+        msg.exec()
+        clicked = msg.clickedButton()
+
+        if clicked == retry_btn:
+            self.start_ollama_installer_download()
+        elif clicked == ps_btn:
+            self.start_ollama_powershell_install_flow()
+        elif clicked == page_btn:
+            open_ollama_download_page()
+
     def _close_progress_dialog(self, dialog_attr_name):
         dialog = getattr(self, dialog_attr_name, None)
         if dialog is not None:
@@ -1083,8 +1186,8 @@ class MainWindow(QWidget):
             dialog.setCancelButton(None)
 
     def request_cancel_model_download(self):
-        worker = self.model_download_worker
-        dialog = self.model_download_dialog
+        worker = self.model_pull_worker
+        dialog = self.model_pull_dialog
         if worker is not None:
             worker.cancel()
         if dialog is not None:
@@ -1098,6 +1201,7 @@ class MainWindow(QWidget):
 
         self.result_box.append("")
         self.result_box.append("=== 开始下载 Ollama 安装器 ===")
+        self.set_ui_busy(True, "正在下载 Ollama 安装器...")
 
         dialog = QProgressDialog("正在下载 Ollama 安装器...", "取消", 0, 100, self)
         dialog.setWindowTitle("下载安装 Ollama")
@@ -1139,6 +1243,7 @@ class MainWindow(QWidget):
         self._close_progress_dialog("ollama_download_dialog")
         self._cleanup_thread_worker("ollama_download_thread", "ollama_download_worker")
 
+        self.set_ui_busy(False)
         self.result_box.append(f"Ollama 安装器下载完成：{installer_path}")
 
         try:
@@ -1164,6 +1269,8 @@ class MainWindow(QWidget):
         self._close_progress_dialog("ollama_download_dialog")
         self._cleanup_thread_worker("ollama_download_thread", "ollama_download_worker")
 
+        self.set_ui_busy(False)
+
         if "取消" in error_text:
             self.result_box.append("已取消 Ollama 安装器下载。")
             self.result_box.append("")
@@ -1171,13 +1278,14 @@ class MainWindow(QWidget):
 
         self.result_box.append(f"Ollama 安装器下载失败：{error_text}")
         self.result_box.append("")
-        QMessageBox.critical(self, "下载失败", f"下载 Ollama 安装器时出现错误：\n{error_text}")
+        self.show_ollama_download_failure_dialog(error_text)
 
     def check_ollama_post_install(self):
         self.install_check_attempts += 1
 
         if check_ollama_running() or try_start_ollama(timeout=2):
             self.install_check_timer.stop()
+            self.set_ui_busy(False)
             self.update_ollama_status()
             self.result_box.append("已检测到 Ollama 安装完成并成功启动。")
             self.result_box.append("")
@@ -1186,6 +1294,7 @@ class MainWindow(QWidget):
 
         if self.install_check_attempts >= 40:
             self.install_check_timer.stop()
+            self.set_ui_busy(False)
             self.update_ollama_status()
             self.result_box.append("暂时还没有检测到 Ollama 启动。你可以完成安装后，再点击“检测 / 启动 Ollama”。")
             self.result_box.append("")
@@ -1196,6 +1305,8 @@ class MainWindow(QWidget):
             return
 
         self._last_model_pull_text = ""
+        self.set_ui_busy(True, f"正在部署 {model_id}...")
+        self.set_deploying_state(True, model_id)
         dialog = QProgressDialog(f"正在准备部署 {model_id} ...", "取消", 0, 100, self)
         dialog.setWindowTitle("部署模型")
         dialog.setWindowModality(Qt.WindowModal)
@@ -1232,6 +1343,9 @@ class MainWindow(QWidget):
                 dialog.setRange(0, 100)
             dialog.setValue(percent)
 
+        if text:
+            self.busy_state_label.setText(f"当前状态：{text}")
+
         if text and text != self._last_model_pull_text:
             self.result_box.append(text)
             self._last_model_pull_text = text
@@ -1240,15 +1354,35 @@ class MainWindow(QWidget):
         self._close_progress_dialog("model_pull_dialog")
         self._cleanup_thread_worker("model_pull_thread", "model_pull_worker")
 
+        self.set_ui_busy(False)
+        self.set_deploying_state(False)
         self.result_box.append("=== 部署结果 ===")
         self.result_box.append(json.dumps(result, ensure_ascii=False, indent=2))
         self.result_box.append("")
 
-        QMessageBox.information(self, "部署完成", f"{result.get('model', '--')} 已完成检查/部署。")
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Information)
+        msg.setWindowTitle("部署成功")
+        msg.setText("部署成功。")
+        msg.setInformativeText("你现在可以直接打开 Ollama，在里面选中我们本地部署的模型（一般在可选模型最下方）进行对话。")
+        open_btn = msg.addButton("打开 Ollama", QMessageBox.AcceptRole)
+        msg.addButton("我知道了", QMessageBox.RejectRole)
+        msg.exec()
+
+        if msg.clickedButton() == open_btn:
+            if not open_ollama_app():
+                QMessageBox.information(
+                    self,
+                    "无法自动打开",
+                    "没有成功自动打开 Ollama。你可以手动打开第一步安装的 Ollama，在里面选择刚部署好的本地模型进行对话。",
+                )
 
     def on_model_pull_error(self, error_text: str):
         self._close_progress_dialog("model_pull_dialog")
         self._cleanup_thread_worker("model_pull_thread", "model_pull_worker")
+
+        self.set_ui_busy(False)
+        self.set_deploying_state(False)
 
         if "取消" in error_text:
             self.result_box.append("已取消模型下载。")
@@ -1260,6 +1394,55 @@ class MainWindow(QWidget):
         self.result_box.append(error_text)
         self.result_box.append("")
         QMessageBox.critical(self, "部署失败", f"部署模型时出现错误：\n{error_text}")
+
+    def start_deploy_animation(self, model_id: str = ""):
+        self._deploy_anim_base_text = f"正在部署 {model_id}".strip()
+        self._deploy_anim_button_base = self._deploy_anim_base_text
+        self._deploy_anim_dots = 0
+        self._tick_deploy_animation()
+        if not self.deploy_anim_timer.isActive():
+            self.deploy_anim_timer.start()
+
+    def stop_deploy_animation(self):
+        if self.deploy_anim_timer.isActive():
+            self.deploy_anim_timer.stop()
+        self._deploy_anim_base_text = ""
+        self._deploy_anim_button_base = ""
+        self._deploy_anim_dots = 0
+
+    def _tick_deploy_animation(self):
+        if not self._deploy_anim_base_text:
+            return
+        self._deploy_anim_dots = (self._deploy_anim_dots + 1) % 4
+        dots = "." * self._deploy_anim_dots
+        suffix = dots if dots else ""
+        status_text = self._deploy_anim_base_text + suffix
+        self.busy_state_label.setText(f"当前状态：{status_text}")
+        self.deploy_button.setText(status_text)
+
+    def set_ui_busy(self, busy: bool, message: str = ""):
+        self.scan_button.setEnabled(not busy)
+        self.ollama_button.setEnabled(not busy)
+        self.install_ollama_button.setEnabled(not busy)
+        self.strategy_combo.setEnabled(not busy)
+
+        has_selection = self.current_model is not None
+        self.deploy_button.setEnabled((not busy) and has_selection)
+        self.chat_button.setEnabled((not busy) and has_selection)
+
+        if busy:
+            if not self.deploy_anim_timer.isActive():
+                self.busy_state_label.setText(f"当前状态：{message or '正在处理，请稍候...'}")
+        else:
+            self.busy_state_label.setText("当前状态：空闲")
+
+    def set_deploying_state(self, deploying: bool, model_id: str = ""):
+        if deploying:
+            self.start_deploy_animation(model_id)
+        else:
+            self.stop_deploy_animation()
+            self.deploy_button.setText("一键部署当前模型")
+
 
     def set_catalog_mode_label(self, mode: str, message: str = ""):
         mode_text_map = {
@@ -1342,10 +1525,6 @@ class MainWindow(QWidget):
             lines.append(f"新鲜度标签：{item['freshness_badge']}")
         if item.get("deploy_level"):
             lines.append(f"部署门槛：{item['deploy_level']}")
-        if item.get("deploy_tip"):
-            lines.append(f"部署提示：{item['deploy_tip']}")
-        if item.get("not_recommended_explanation"):
-            lines.append(f"更大参数说明：{item['not_recommended_explanation']}")
 
         self.current_model_label.setText("\n".join(lines))
         if item.get("limit_summary"):
@@ -1353,8 +1532,9 @@ class MainWindow(QWidget):
             if item.get("limit_examples_text"):
                 explain_text += f"\n{item['limit_examples_text']}"
             self.limit_explain_label.setText(explain_text)
-        self.deploy_button.setEnabled(True)
-        self.chat_button.setEnabled(True)
+        if self.model_pull_thread is None and self.ollama_download_thread is None:
+            self.deploy_button.setEnabled(True)
+            self.chat_button.setEnabled(True)
 
         for card in self.recommendation_cards:
             card.set_selected(card.item["deploy_id"] == item["deploy_id"])
@@ -1367,15 +1547,16 @@ class MainWindow(QWidget):
             hardware = get_hardware_info()
             catalog_state = load_recent_supported_models_with_fallback(limit_per_family=8)
             recent_models = catalog_state["models"]
-            user_preference = self.preference_combo.currentData()
-            sort_mode = self.sort_combo.currentData()
+            strategy = self.strategy_combo.currentData() or {"preference": "balanced", "sort": "overall"}
+            user_preference = strategy.get("preference", "balanced")
+            sort_mode = strategy.get("sort", "overall")
             recommendations = recommend_from_recent_models(
                 recent_models,
                 hardware,
                 category="general",
                 user_preference=user_preference,
                 sort_mode=sort_mode,
-                top_n=8,
+                top_n=RECOMMENDATION_LIMIT,
             )
         except Exception as e:
             QMessageBox.critical(self, "扫描失败", f"扫描或推荐过程中出现错误：\n{e}")
@@ -1388,6 +1569,8 @@ class MainWindow(QWidget):
         self.deploy_button.setEnabled(False)
         self.chat_button.setEnabled(False)
         self.chat_box.clear()
+        self.set_ui_busy(False)
+        self.set_deploying_state(False)
 
         self.set_hardware_summary(hardware)
         self.set_catalog_mode_label(catalog_state.get("mode", "unknown"), catalog_state.get("message", ""))
@@ -1399,8 +1582,7 @@ class MainWindow(QWidget):
         output_lines.append("")
         output_lines.extend(self.build_catalog_log_lines(catalog_state))
         output_lines.append("=== 推荐结果 ===")
-        output_lines.append(f"当前推荐偏好: {user_preference}")
-        output_lines.append(f"当前排序方式: {sort_mode}")
+        output_lines.append(f"当前推荐模式: {self.strategy_combo.currentText()} ({user_preference} / {sort_mode})")
         output_lines.append("")
 
         if recommendations:
@@ -1456,6 +1638,10 @@ class MainWindow(QWidget):
             QMessageBox.information(self, "未选择模型", "请先选择一个推荐模型。")
             return
 
+        if self.model_pull_thread is not None:
+            QMessageBox.information(self, "正在部署", "当前已有模型正在下载/部署，请稍候。")
+            return
+
         model_id = self.current_model["deploy_id"]
         confirm_text = "\n".join([
             f"模型家族：{self.current_model.get('family_display_name', '--')}",
@@ -1481,24 +1667,95 @@ class MainWindow(QWidget):
 
         self.result_box.append("")
         self.result_box.append(f"=== 开始部署 {model_id} ===")
-
-        try:
-            result = ensure_model_installed(model_id)
-        except Exception as e:
-            QMessageBox.critical(self, "部署失败", f"部署模型时出现错误：\n{e}")
-            self.result_box.append("=== 部署失败 ===")
-            self.result_box.append(str(e))
-            self.result_box.append("")
-            return
-
-        self.result_box.append("=== 部署结果 ===")
-        self.result_box.append(json.dumps(result, ensure_ascii=False, indent=2))
+        self.result_box.append("已进入后台部署流程，界面会保持响应，请勿重复点击部署按钮。")
         self.result_box.append("")
 
-        QMessageBox.information(self, "部署完成", f"{model_id} 已完成检查/部署。")
+        self.start_model_download_with_progress(model_id)
+
+    def start_chat_generation(self, model_id: str, prompt: str):
+        if self.chat_thread is not None:
+            QMessageBox.information(self, "正在调用", "当前已有模型调用任务正在进行，请稍候。")
+            return
+
+        self.chat_box.setPlainText(
+            f"正在调用 {model_id} ...\n\n首次调用刚部署的大模型时，模型加载可能比较慢，请耐心等待。"
+        )
+        self.busy_state_label.setText(f"当前状态：正在调用 {model_id} ...")
+        self.chat_button.setEnabled(False)
+        self.prompt_box.setEnabled(False)
+        self.deploy_button.setEnabled(False)
+
+        dialog = QProgressDialog(
+            "正在调用模型，首次加载可能需要更长时间，请耐心等待...",
+            None,
+            0,
+            0,
+            self,
+        )
+        dialog.setWindowTitle("调用模型")
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setCancelButton(None)
+        dialog.show()
+        self.chat_dialog = dialog
+
+        thread = QThread(self)
+        worker = ChatGenerateWorker(model_id, prompt)
+        worker.moveToThread(thread)
+
+        worker.finished.connect(self.on_chat_finished)
+        worker.error.connect(self.on_chat_error)
+        thread.started.connect(worker.run)
+
+        self.chat_thread = thread
+        self.chat_worker = worker
+        thread.start()
+
+    def on_chat_finished(self, reply: str):
+        self._close_progress_dialog("chat_dialog")
+        self._cleanup_thread_worker("chat_thread", "chat_worker")
+
+        self.chat_box.setPlainText(reply)
+        self.prompt_box.setEnabled(True)
+        self.busy_state_label.setText("当前状态：空闲")
+
+        has_selection = self.current_model is not None
+        self.chat_button.setEnabled(has_selection)
+        self.deploy_button.setEnabled(has_selection)
+
+    def on_chat_error(self, error_text: str):
+        self._close_progress_dialog("chat_dialog")
+        self._cleanup_thread_worker("chat_thread", "chat_worker")
+
+        self.prompt_box.setEnabled(True)
+        self.busy_state_label.setText("当前状态：空闲")
+
+        has_selection = self.current_model is not None
+        self.chat_button.setEnabled(has_selection)
+        self.deploy_button.setEnabled(has_selection)
+
+        friendly_error = error_text
+        if "Read timed out" in error_text or "read timeout" in error_text.lower():
+            friendly_error = (
+                "调用模型超时。首次调用刚部署的大模型时，模型加载可能很慢。\n\n"
+                "请稍等片刻后再试一次；如果还是很慢，建议先改用更小参数的模型。"
+            )
+
+        QMessageBox.critical(self, "调用失败", f"调用模型时出现错误：\n{friendly_error}")
+        self.chat_box.setPlainText(f"调用失败：{friendly_error}")
 
     def handle_chat(self):
         if not self.ensure_ollama_ready():
+            return
+
+        if self.model_pull_thread is not None:
+            self.chat_box.setPlainText("当前正在部署模型，请等待部署完成。")
+            return
+
+        if self.chat_thread is not None:
+            self.chat_box.setPlainText("当前已有模型调用任务正在进行，请稍候。")
             return
 
         if not self.current_model:
@@ -1509,19 +1766,10 @@ class MainWindow(QWidget):
         prompt = self.prompt_box.toPlainText().strip()
 
         if not prompt:
-            self.chat_box.setPlainText("请输入测试问题。")
+            self.chat_box.setPlainText("请输入问题。")
             return
 
-        self.chat_box.setPlainText(f"正在调用 {model_id} ...")
-
-        try:
-            reply = generate_text(model_id, prompt)
-        except Exception as e:
-            QMessageBox.critical(self, "调用失败", f"调用模型时出现错误：\n{e}")
-            self.chat_box.setPlainText(f"调用失败：{e}")
-            return
-
-        self.chat_box.setPlainText(reply)
+        self.start_chat_generation(model_id, prompt)
 
 
 if __name__ == "__main__":
