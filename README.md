@@ -2,7 +2,7 @@
   <img src="assets/hero.png" width="100%" alt="Local LLM Recommender Hero Banner">
 </p>
 
-# Local LLM Recommender
+# Local deployment llm
 
 **一键识别电脑硬件，推荐适合本机的开源大模型，并通过 Ollama 一键部署**
 
